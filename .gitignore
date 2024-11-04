@@ -1,0 +1,7 @@
+/build/
+.cache/
+.idea/
+.vscode/
+.DS_Store
+**/CMakeLists.txt.user
+*-workspace
