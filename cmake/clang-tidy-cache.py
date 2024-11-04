@@ -1,0 +1,1152 @@
+#!/usr/bin/env python3
+# coding: UTF-8
+# Copyright (c) 2019-2024 Matus Chochlik
+# Distributed under the Boost Software License, Version 1.0.
+# See accompanying file LICENSE_1_0.txt or copy at
+#  http://www.boost.org/LICENSE_1_0.txt
+
+import os
+import re
+import sys
+import errno
+import getpass
+import logging
+import hashlib
+import tempfile
+import subprocess
+import json
+import shlex
+import sys
+import time
+import traceback
+import typing as tp
+
+try:
+    import redis
+except ImportError:
+    redis = None
+
+# ------------------------------------------------------------------------------
+class ClangTidyCacheOpts(object):
+    # --------------------------------------------------------------------------
+    def __init__(self, log, args):
+        self._log = log
+        self._directories_with_clang_tidy = []
+
+        # Define the prefix used to identify directories with clang-tidy
+        prefix = '--directories_with_clang_tidy='
+
+        # Iterate through the command line arguments
+        for index, arg in enumerate(args):
+            if arg.startswith(prefix):
+                # Split the argument using '*' as a separator to get a list
+                # of directories, I used '*' because a folder cannot contain
+                # this character in its name whereas it can contain `,`
+                self._directories_with_clang_tidy = arg[len(prefix):].split('*')
+
+                # Remove the argument because clang-tidy will not like it
+                args.pop(index)
+
+                break
+
+        if len(args) < 1:
+            self._log.error("Missing arguments")
+
+        self._original_args = args
+        self._clang_tidy_args = []
+        self._compiler_args = []
+        self._cache_dir = None
+        self._compile_commands_db = None
+
+        self._strip_list = os.getenv("CTCACHE_STRIP", "").split(os.pathsep)
+
+        args = self._split_compiler_clang_tidy_args(args)
+        self._adjust_compiler_args(args)
+
+    # --------------------------------------------------------------------------
+    def running_on_msvc(self):
+        if self._compiler_args:
+           return os.path.basename(self._compiler_args[0]) == "cl.exe"
+        return False
+
+    # --------------------------------------------------------------------------
+    def _split_compiler_clang_tidy_args(self, args):
+        # splits arguments starting with - on the first =
+        args = [arg.split('=', 1) if arg.startswith('-p') else [arg] for arg in args]
+        args = [arg for sub in args for arg in sub]
+
+        if args.count("--") == 1:
+            # Invoked with compiler args on the actual command line
+            i = args.index("--")
+            self._clang_tidy_args = args[:i]
+            self._compiler_args = args[i+1:]
+        elif args.count("-p") == 1:
+            # Invoked with compiler args in a compile commands json db
+            i = args.index("-p")
+            self._clang_tidy_args = args
+
+            i += 1
+            if i >= len(args):
+                return
+
+            cdb_path = args[i]
+            cdb = os.path.join(cdb_path, "compile_commands.json")
+            self._load_compile_command_db(cdb)
+
+            i += 1
+            if i >= len(args):
+                return
+
+            # This assumes that the filename occurs after the -p <cdb path>
+            # and that there is only one of them
+            filenames = [arg for arg in args[i:] if not arg.startswith("-")]
+            if len(filenames) > 0:
+                self._compiler_args = self._compiler_args_for(filenames[0])
+        else:
+            # Invoked as pure clang-tidy command
+            self._clang_tidy_args = args[1:]
+        return args
+
+    # --------------------------------------------------------------------------
+    def _adjust_compiler_args(self, args):
+        if self._compiler_args:
+            self._compiler_args.insert(1, "-D__clang_analyzer__=1")
+            for i in range(1, len(self._compiler_args)):
+                if self._compiler_args[i-1] in ["-o", "--output"]:
+                    self._compiler_args[i] = "-"
+                if self._compiler_args[i-1] in ["-c"]:
+                    self._compiler_args[i-1] = "-E"
+            for i in range(1, len(self._compiler_args)):
+                if self._compiler_args[i-1] in ["-E"]:
+                    if self.running_on_msvc():
+                        self._compiler_args[i-1] = "-EP"
+                    else:
+                        self._compiler_args.insert(i, "-P")
+
+    # --------------------------------------------------------------------------
+    def _load_compile_command_db(self, filename):
+        try:
+            with open(filename) as f:
+                js = f.read().replace(r'\\\"', "'").replace("\\", "\\\\")
+                self._compile_commands_db = json.loads(js)
+        except Exception as err:
+            self._log.error("Loading compile command DB failed: {0}".format(repr(err)))
+            return False
+
+    # --------------------------------------------------------------------------
+    def _compiler_args_for(self, filename):
+        if self._compile_commands_db == None:
+            return []
+
+        filename = os.path.expanduser(filename)
+        filename = os.path.realpath(filename)
+
+        for command in self._compile_commands_db:
+            db_filename = command["file"]
+            try:
+                if os.path.samefile(filename, db_filename):
+                    try:
+                        return shlex.split(command["command"])
+                    except KeyError:
+                        try:
+                            return shlex.split(command["arguments"][0])
+                        except:
+                            return "clang-tidy"
+            except FileNotFoundError:
+                continue
+
+        return []
+
+    # --------------------------------------------------------------------------
+    def should_print_dir(self):
+        try:
+            return self._original_args[0] == "--cache-dir"
+        except IndexError:
+            return False
+
+    # --------------------------------------------------------------------------
+    def should_print_stats(self):
+        try:
+            return self._original_args[0] == "--show-stats"
+        except IndexError:
+            return False
+
+    # --------------------------------------------------------------------------
+    def should_remove_dir(self):
+        try:
+            return self._original_args[0] == "--clean"
+        except IndexError:
+            return False
+
+    # --------------------------------------------------------------------------
+    def should_zero_stats(self):
+        try:
+            return self._original_args[0] == "--zero-stats"
+        except IndexError:
+            return False
+
+    # --------------------------------------------------------------------------
+    def directories_with_clang_tidy(self):
+        return self._directories_with_clang_tidy
+
+    # --------------------------------------------------------------------------
+    def original_args(self):
+        return self._original_args
+
+    # --------------------------------------------------------------------------
+    def clang_tidy_args(self):
+        return self._clang_tidy_args
+
+    # --------------------------------------------------------------------------
+    def compiler_args(self):
+        return self._compiler_args
+
+    # --------------------------------------------------------------------------
+    @property
+    def cache_dir(self):
+        if self._cache_dir:
+            return self._cache_dir
+
+        try:
+            user = getpass.getuser()
+        except KeyError:
+            user = "unknown"
+        self._cache_dir = os.getenv(
+            "CTCACHE_DIR",
+            os.path.join(
+                tempfile.tempdir if tempfile.tempdir else "/tmp", "ctcache-" + user
+            ),
+        )
+        return self._cache_dir
+
+    # --------------------------------------------------------------------------
+    def adjust_chunk(self, x):
+        x = x.strip()
+        r = str().encode("utf8")
+        if not x.startswith("# "):
+            for w in x.split():
+                w = w.strip('"')
+                if os.path.exists(w):
+                    w = os.path.realpath(w)
+                for item in self._strip_list:
+                    w = w.replace(item, '')
+                w.strip()
+                if w:
+                    r += w.encode("utf8")
+        return r
+
+    # --------------------------------------------------------------------------
+    def has_s3(self):
+        return "CTCACHE_S3_BUCKET" in os.environ
+
+    # --------------------------------------------------------------------------
+    def s3_bucket(self):
+        return os.getenv("CTCACHE_S3_BUCKET")
+
+    # --------------------------------------------------------------------------
+    def s3_bucket_folder(self):
+        return os.getenv("CTCACHE_S3_FOLDER", 'clang-tidy-cache')
+
+    # --------------------------------------------------------------------------
+    def s3_no_credentials(self):
+        return os.getenv("CTCACHE_S3_NO_CREDENTIALS", "")
+
+    # --------------------------------------------------------------------------
+    def has_gcs(self):
+        return "CTCACHE_GCS_BUCKET" in os.environ
+
+    # --------------------------------------------------------------------------
+    def gcs_bucket(self):
+        return os.getenv("CTCACHE_GCS_BUCKET")
+
+    # --------------------------------------------------------------------------
+    def gcs_bucket_folder(self):
+        return os.getenv("CTCACHE_GCS_FOLDER", 'clang-tidy-cache')
+
+    # --------------------------------------------------------------------------
+    def gcs_no_credentials(self):
+        return os.getenv("CTCACHE_GCS_NO_CREDENTIALS", None)
+
+    # --------------------------------------------------------------------------
+    def cache_locally(self):
+        return os.getenv("CTCACHE_LOCAL", "0") == "1"
+
+    # --------------------------------------------------------------------------
+    def no_local_stats(self):
+        return os.getenv("CTCACHE_NO_LOCAL_STATS", "0") == "1"
+
+    # --------------------------------------------------------------------------
+    def has_host(self):
+        return os.getenv("CTCACHE_HOST") is not None
+
+    # --------------------------------------------------------------------------
+    def rest_host(self):
+        return os.getenv("CTCACHE_HOST", "localhost")
+
+    # --------------------------------------------------------------------------
+    def rest_proto(self):
+        return os.getenv("CTCACHE_PROTO", "http")
+
+    # --------------------------------------------------------------------------
+    def rest_port(self):
+        return int(os.getenv("CTCACHE_PORT", 5000))
+
+    # --------------------------------------------------------------------------
+    def save_output(self) -> bool:
+        return os.getenv("CTCACHE_SAVE_OUTPUT", "0") == "1"
+
+    # --------------------------------------------------------------------------
+    def ignore_output(self) -> bool:
+        return self.save_output() or "CTCACHE_IGNORE_OUTPUT" in os.environ
+
+    # --------------------------------------------------------------------------
+    def debug_enabled(self):
+        return "CTCACHE_DEBUG" in os.environ
+
+    # --------------------------------------------------------------------------
+    def dump_enabled(self):
+        return "CTCACHE_DUMP" in os.environ
+
+    # --------------------------------------------------------------------------
+    def dump_dir(self):
+        return os.getenv("CTCACHE_DUMP_DIR", tempfile.gettempdir())
+
+    # --------------------------------------------------------------------------
+    def exclude_hash_regex(self):
+        return os.getenv("CTCACHE_EXCLUDE_HASH_REGEX")
+
+    # --------------------------------------------------------------------------
+    def exclude_hash(self, chunk):
+        return self.exclude_hash_regex() is not None and \
+            re.match(self.exclude_hash_regex(), chunk.decode("utf8"))
+
+    # --------------------------------------------------------------------------
+    def has_redis_host(self) -> bool:
+        return "CTCACHE_REDIS_HOST" in os.environ
+
+    # --------------------------------------------------------------------------
+    def redis_host(self) -> str:
+        return os.getenv("CTCACHE_REDIS_HOST", "")
+
+    # --------------------------------------------------------------------------
+    def redis_port(self) -> int:
+        return int(os.getenv("CTCACHE_REDIS_PORT", "6379"))
+
+    # --------------------------------------------------------------------------
+    def redis_username(self) -> str:
+        return os.getenv("CTCACHE_REDIS_USERNAME", "")
+
+    # --------------------------------------------------------------------------
+    def redis_password(self) -> str:
+        return os.getenv("CTCACHE_REDIS_PASSWORD", "")
+
+    # --------------------------------------------------------------------------
+    def redis_namespace(self) -> str:
+        return os.getenv("CTCACHE_REDIS_NAMESPACE", "ctcache/")
+
+# ------------------------------------------------------------------------------
+class ClangTidyCacheHash(object):
+    # --------------------------------------------------------------------------
+    def _opendump(self, opts):
+        return open(os.path.join(opts.dump_dir(), "ctcache.dump"), "ab")
+
+    # --------------------------------------------------------------------------
+    def __init__(self, opts):
+        self._hash = hashlib.sha1()
+        if opts.dump_enabled():
+            self._dump = self._opendump(opts)
+        else:
+            self._dump = None
+        assert self._dump or not opts.dump_enabled()
+
+    # --------------------------------------------------------------------------
+    def __del__(self):
+        if self._dump:
+            self._dump.close()
+
+    # --------------------------------------------------------------------------
+    def update(self, content):
+        if content:
+            self._hash.update(content)
+            if self._dump:
+                self._dump.write(content)
+
+    # --------------------------------------------------------------------------
+    def hexdigest(self):
+        return self._hash.hexdigest()
+
+# ------------------------------------------------------------------------------
+class ClangTidyServerCache(object):
+    def __init__(self, log, opts):
+        import requests
+        self._requests = requests
+        self._log = log
+        self._opts = opts
+
+    # --------------------------------------------------------------------------
+    def is_cached(self, digest):
+        try:
+            query = self._requests.get(self._make_query_url(digest), timeout=3)
+            if query.status_code == 200:
+                if query.json() == True:
+                    return True
+                elif query.json() == False:
+                    return False
+                else:
+                    self._log.error("is_cached: Can't connect to server {0}, error {1}".format(
+                        self._opts.rest_host(), query.status_code))
+        except:
+            pass
+        return False
+
+    # --------------------------------------------------------------------------
+    def get_cache_data(self, digest) -> tp.Optional[bytes]:
+        # TODO
+        return None
+
+    # --------------------------------------------------------------------------
+    def store_in_cache(self, digest):
+        try:
+            query = self._requests.get(self._make_store_url(digest), timeout=3)
+            if query.status_code == 200:
+                return
+            else:
+                self._log.error("store_in_cache: Can't store data in server {0}, error {1}".format(
+                    self._opts.rest_host(), query.status_code))
+        except:
+            pass
+
+    # --------------------------------------------------------------------------
+    def store_in_cache_with_data(self, digest, data: bytes):
+        # TODO
+        pass
+
+    # --------------------------------------------------------------------------
+    def query_stats(self, options):
+        try:
+            query = self._requests.get(self._make_stats_url(), timeout=3)
+            if query.status_code == 200:
+                return query.json()
+            else:
+                self._log.error("query_stats: Can't connect to server {0}, error {1}".format(
+                    self._opts.rest_host(), query.status_code))
+        except:
+            pass
+        return None
+
+    # --------------------------------------------------------------------------
+    def clear_stats(self, options):
+        # Not implemented
+        pass
+
+    # --------------------------------------------------------------------------
+    def _make_query_url(self, digest):
+        return "%(proto)s://%(host)s:%(port)d/is_cached/%(digest)s" % {
+            "proto": self._opts.rest_proto(),
+            "host": self._opts.rest_host(),
+            "port": self._opts.rest_port(),
+            "digest": digest
+        }
+
+    # --------------------------------------------------------------------------
+    def _make_store_url(self, digest):
+        return "%(proto)s://%(host)s:%(port)d/cache/%(digest)s" % {
+            "proto": self._opts.rest_proto(),
+            "host": self._opts.rest_host(),
+            "port": self._opts.rest_port(),
+            "digest": digest
+        }
+
+    # --------------------------------------------------------------------------
+    def _make_stats_url(self):
+        return "%(proto)s://%(host)s:%(port)d/stats" % {
+            "proto": self._opts.rest_proto(),
+            "host": self._opts.rest_host(),
+            "port": self._opts.rest_port()
+        }
+
+# ------------------------------------------------------------------------------
+class MultiprocessLock:
+    # --------------------------------------------------------------------------
+    def __init__(self, lock_path, timeout=3): # timeout 3 seconds
+        self._lock_path = os.path.abspath(os.path.expanduser(lock_path))
+        self._timeout = timeout
+        self._lock_handle = None
+
+    # --------------------------------------------------------------------------
+    def acquire(self):
+        start_time = time.time()
+        while True:
+            try:
+                # Attempt to create the lock file exclusively
+                self._lock_handle = os.open(self._lock_path, os.O_CREAT | os.O_EXCL)
+                return self
+            except FileExistsError:
+                # File is locked, check if the timeout has been exceeded
+                if time.time() - start_time > self._timeout:
+                    raise RuntimeError(msg)
+                # Wait and try again
+                time.sleep(0.1)
+            except FileNotFoundError:
+                # The path to the lock file doesn't exist, create it and retry
+                os.makedirs(os.path.dirname(self._lock_path), exist_ok=True)
+
+    # --------------------------------------------------------------------------
+    def release(self):
+        if self._lock_handle is not None:
+            try:
+                os.close(self._lock_handle)
+                os.unlink(self._lock_path)  # Remove the lock file upon release
+            except OSError:
+                pass  # Ignore errors if the file doesn't exist or has already been released
+            finally:
+                self._lock_handle = None
+
+    # --------------------------------------------------------------------------
+    def __enter__(self):
+        return self.acquire()
+
+    # --------------------------------------------------------------------------
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.release()
+
+# ------------------------------------------------------------------------------
+class ClangTidyLocalStats(object):
+    # --------------------------------------------------------------------------
+    def __init__(self, log, opts):
+        self._log = log
+        self._opts = opts
+
+    # --------------------------------------------------------------------------
+    def stats_file(self):
+        return os.path.join(self._opts.cache_dir, "stats")
+
+    # --------------------------------------------------------------------------
+    def read(self):
+        with MultiprocessLock(self.stats_file() + ".lock") as _:
+            if os.path.isfile(self.stats_file()):
+                with open(self.stats_file(), 'r') as f:
+                    content = f.read().split()
+                    if len(content) == 2:
+                        return int(content[0]), int(content[1])
+                    else:
+                        self._log.error(f"Invalid stats content in: {self.stats_file()}")
+            return 0,0
+
+    # --------------------------------------------------------------------------
+    def update(self, hit):
+        try:
+            hits, misses = self.read()
+            with MultiprocessLock(self.stats_file() + ".lock") as _:
+                if hit:
+                    hits += 1
+                else:
+                    misses += 1
+                try:
+                    with open(self.stats_file(), 'w') as fh:
+                        fh.write(f"{hits} {misses}\n")
+                except IOError as e:
+                    self._log_error(f"Error writing to file: {e}")
+        except Exception as e:
+            traceback.print_exc(file=sys.stdout)
+            raise
+
+    # --------------------------------------------------------------------------
+    def clear(self):
+        if os.path.exists(self.stats_file()):
+            os.unlink(self.stats_file())
+
+# ------------------------------------------------------------------------------
+class ClangTidyLocalCache(object):
+    # --------------------------------------------------------------------------
+    def __init__(self, log, opts):
+        self._log = log
+        self._opts = opts
+        self._hash_regex = re.compile(r'^[0-9a-f]{38}$')
+        if opts.no_local_stats():
+            self._stats = None
+        else:
+            self._stats = ClangTidyLocalStats(log, opts)
+
+    # --------------------------------------------------------------------------
+    def is_cached(self, digest):
+        path = self._make_path(digest)
+        if os.path.isfile(path):
+            os.utime(path, None)
+            if self._stats:
+                self._stats.update(True)
+            return True
+
+        if self._stats:
+            self._stats.update(False)
+        return False
+
+    # --------------------------------------------------------------------------
+    def get_cache_data(self, digest) -> tp.Optional[bytes]:
+        path = self._make_path(digest)
+        if os.path.isfile(path):
+            os.utime(path, None)
+            if self._stats:
+                self._stats.update(True)
+            with open(path, "rb") as stream:
+                return stream.read()
+        else:
+            if self._stats:
+                self._stats.update(False)
+            return None
+
+    # --------------------------------------------------------------------------
+    def store_in_cache(self, digest):
+        p = self._make_path(digest)
+        self._mkdir_p(os.path.dirname(p))
+        open(p, "w").close()
+
+    # --------------------------------------------------------------------------
+    def store_in_cache_with_data(self, digest, data: bytes):
+        p = self._make_path(digest)
+        self._mkdir_p(os.path.dirname(p))
+        with open(p, "wb") as stream:
+            stream.write(data)
+
+    # --------------------------------------------------------------------------
+    def _list_cached_files(self, options, prefix):
+        for root, dirs, files in os.walk(prefix):
+            for prefix in dirs:
+                for filename in self._list_cached_files(options, prefix):
+                    if self._hash_regex.match(filename):
+                        yield root, prefix, filename
+            for filename in files:
+                if self._hash_regex.match(filename):
+                    yield root, prefix, filename
+
+    # --------------------------------------------------------------------------
+    def query_stats(self, options):
+        if self._stats:
+            hits, misses = self._stats.read()
+            total = hits + misses
+
+            hash_count = sum(1 for x in self._list_cached_files(options, options.cache_dir))
+
+            return {
+                "hit_count": hits,
+                "miss_count": misses,
+                "hit_rate": hits/total if total else 0,
+                "miss_rate": misses/total if total else 0,
+                "cached_count": hash_count}
+
+    # --------------------------------------------------------------------------
+    def clear_stats(self, options):
+        if self._stats:
+            self._stats.clear()
+
+    # --------------------------------------------------------------------------
+    def _mkdir_p(self, path):
+        try:
+            os.makedirs(path)
+        except OSError as os_error:
+            if os_error.errno == errno.EEXIST and os.path.isdir(path):
+                pass
+            else:
+                raise
+
+    # --------------------------------------------------------------------------
+    def _make_path(self, digest):
+        return os.path.join(self._opts.cache_dir, digest[:2], digest[2:])
+
+# ------------------------------------------------------------------------------
+class ClangTidyRedisCache(object):
+    # --------------------------------------------------------------------------
+    def __init__(self, log, opts: ClangTidyCacheOpts):
+        self._log = log
+        self._opts = opts
+        assert redis
+        self._cli = redis.Redis(
+            host=opts.redis_host(),
+            port=opts.redis_port(),
+            username=opts.redis_username(),
+            password=opts.redis_password(),
+        )
+        self._namespace = opts.redis_namespace()
+
+    # --------------------------------------------------------------------------
+    def _get_key_from_digest(self, digest) -> str:
+        return self._namespace + digest
+
+    # --------------------------------------------------------------------------
+    def is_cached(self, digest) -> bool:
+        n_digest = self._get_key_from_digest(digest)
+        return self._cli.get(n_digest) is not None
+
+    # --------------------------------------------------------------------------
+    def get_cache_data(self, digest) -> tp.Optional[bytes]:
+        n_digest = self._get_key_from_digest(digest)
+        return self._cli.get(n_digest)
+
+    # --------------------------------------------------------------------------
+    def store_in_cache(self, digest):
+        n_digest = self._get_key_from_digest(digest)
+        self._cli.set(n_digest, "")
+
+    # --------------------------------------------------------------------------
+    def store_in_cache_with_data(self, digest, data: bytes):
+        n_digest = self._get_key_from_digest(digest)
+        self._cli.set(n_digest, data)
+
+    # --------------------------------------------------------------------------
+    def query_stats(self, options):
+        # TODO
+        pass
+
+    # --------------------------------------------------------------------------
+    def clear_stats(self, options):
+        # TODO
+        pass
+
+# ------------------------------------------------------------------------------
+class ClangTidyS3Cache(object):
+    # --------------------------------------------------------------------------
+    def __init__(self, log, opts):
+        from boto3 import client
+        from botocore.exceptions import ClientError
+        from botocore.config import Config
+        from botocore.session import UNSIGNED
+
+        self._ClientError = ClientError
+        self._log = log
+        self._opts = opts
+        if self._opts.s3_no_credentials():
+            self._client = client("s3", config=Config(signature_version=UNSIGNED))
+        else:
+            self._client = client("s3")
+        self._bucket = opts.s3_bucket()
+        self._bucket_folder = opts.s3_bucket_folder()
+
+    # --------------------------------------------------------------------------
+    def is_cached(self, digest):
+        try:
+            path = self._make_path(digest)
+            self._client.get_object(Bucket=self._bucket, Key=path)
+        except self._ClientError as e:
+            if e.response['Error']['Code'] == "NoSuchKey":
+                return False
+            else:
+                self._log.error(
+                    "Error calling S3:get_object {}".format(str(e)))
+                raise
+
+        return True
+
+    # --------------------------------------------------------------------------
+    def get_cache_data(self, digest) -> tp.Optional[bytes]:
+        # TODO
+        return None
+
+    # --------------------------------------------------------------------------
+    def store_in_cache(self, digest):
+        if self._opts.s3_no_credentials():
+            return
+        try:
+            path = self._make_path(digest)
+            self._client.put_object(Bucket=self._bucket, Key=path, Body=digest)
+        except self._ClientError as e:
+            self._log.error("Error calling S3:put_object {}".format(str(e)))
+            raise
+
+    # --------------------------------------------------------------------------
+    def store_in_cache_with_data(self, digest, data: bytes):
+        # TODO
+        pass
+
+    # --------------------------------------------------------------------------
+    def query_stats(self, options):
+        # TODO
+        pass
+
+    # --------------------------------------------------------------------------
+    def clear_stats(self, options):
+        # TODO
+        pass
+
+    # --------------------------------------------------------------------------
+    def _make_path(self, digest):
+        return os.path.join(self._bucket_folder, digest[:2], digest[2:])
+
+# ------------------------------------------------------------------------------
+class ClangTidyGcsCache(object):
+    # --------------------------------------------------------------------------
+    def __init__(self, log, opts):
+        import google.cloud.storage as gcs
+
+        self._log = log
+        self._opts = opts
+        if self._opts.gcs_no_credentials():
+            self._client = gcs.Client.create_anonymous_client()
+        else:
+            self._client = gcs.Client()
+        self._bucket = self._client.bucket(opts.gcs_bucket())
+        self._bucket_folder = opts.gcs_bucket_folder()
+
+    # --------------------------------------------------------------------------
+    def is_cached(self, digest):
+        try:
+            path = self._make_path(digest)
+            blob = self._bucket.blob(path)
+            t = blob.exists()
+            return t
+        except Exception as e:
+            self._log.error("Error calling GCS:blob.exists {}".format(str(e)))
+            raise
+
+    # --------------------------------------------------------------------------
+    def get_cache_data(self, digest) -> tp.Optional[bytes]:
+        try:
+            path = self._make_path(digest)
+            blob = self._bucket.blob(path)
+            return blob.download_as_bytes()
+        except Exception as e:
+            return None
+
+    # --------------------------------------------------------------------------
+    def store_in_cache(self, digest):
+        if self._opts.gcs_no_credentials():
+            return
+        try:
+            path = self._make_path(digest)
+            blob = self._bucket.blob(path)
+            blob.upload_from_string(digest)
+        except Exception as e:
+            self._log.error(
+                "Error calling GCS:blob.upload_from_string {}".format(str(e)))
+            raise
+
+    # --------------------------------------------------------------------------
+    def store_in_cache_with_data(self, digest, data: bytes):
+        if self._opts.gcs_no_credentials():
+            return
+        try:
+            path = self._make_path(digest)
+            blob = self._bucket.blob(path)
+            blob.upload_from_string(data, content_type="application/octet-stream")
+        except Exception as e:
+            self._log.error(
+                "Error calling GCS:blob.upload_from_string {}".format(str(e)))
+            raise
+
+    # --------------------------------------------------------------------------
+    def query_stats(self, options):
+        # TODO
+        pass
+
+    # --------------------------------------------------------------------------
+    def clear_stats(self, options):
+        # TODO
+        pass
+
+    # --------------------------------------------------------------------------
+    def _make_path(self, digest):
+        return os.path.join(self._bucket_folder, digest[:2], digest[2:])
+
+# ------------------------------------------------------------------------------
+class ClangTidyCache(object):
+    # --------------------------------------------------------------------------
+    def __init__(self, log, opts: ClangTidyCacheOpts):
+        self._log = log
+        self._opts = opts
+        self._caches = []
+
+        if opts.has_host():
+            self._caches.append(ClangTidyServerCache(log, opts))
+
+        if opts.has_redis_host() and redis:
+            self._caches.append(ClangTidyRedisCache(log, opts))
+
+        if opts.has_s3():
+            self._caches.append(ClangTidyS3Cache(log, opts))
+
+        if opts.has_gcs():
+            self._caches.append(ClangTidyGcsCache(log, opts))
+
+        if not self._caches or opts.cache_locally():
+            self._caches.append(ClangTidyLocalCache(log, opts))
+
+    # --------------------------------------------------------------------------
+    def is_cached(self, digest):
+        for cache in self._caches:
+            if cache.is_cached(digest):
+                return True
+
+        return False
+
+    # --------------------------------------------------------------------------
+    def get_cache_data(self, digest) -> tp.Optional[bytes]:
+        for cache in self._caches:
+            data = cache.get_cache_data(digest)
+            if data:
+                return data
+
+        return None
+
+    # --------------------------------------------------------------------------
+    def store_in_cache(self, digest):
+        for cache in self._caches:
+            cache.store_in_cache(digest)
+
+    # --------------------------------------------------------------------------
+    def store_in_cache_with_data(self, digest, data: bytes):
+        for cache in self._caches:
+            cache.store_in_cache_with_data(digest, data)
+
+    # --------------------------------------------------------------------------
+    def query_stats(self, options):
+        for cache in self._caches:
+            stats = cache.query_stats(options)
+            if stats:
+                return stats
+
+        return {}
+
+    # --------------------------------------------------------------------------
+    def clear_stats(self, options):
+        for cache in self._caches:
+            cache.clear_stats(options)
+
+# ------------------------------------------------------------------------------
+source_file_change_re = re.compile(r'#\s+\d+\s+"([^"]+)".*')
+
+def source_file_changed(cpp_line):
+    found = source_file_change_re.match(cpp_line)
+    if found:
+        found_path = found.group(1)
+        if os.path.isfile(found_path):
+            return os.path.realpath(os.path.dirname(found_path))
+
+# ------------------------------------------------------------------------------
+def find_ct_config(search_path):
+    while search_path and search_path != "/":
+        search_path = os.path.dirname(search_path)
+        ct_config = os.path.join(search_path, '.clang-tidy')
+        if os.path.isfile(ct_config):
+            return ct_config
+
+# ------------------------------------------------------------------------------
+def hash_inputs(opts):
+    ct_args = opts.clang_tidy_args()
+    co_args = opts.compiler_args()
+
+    if not ct_args and not co_args:
+        return None
+
+    def _is_src_ext(s):
+        exts = [".cppm", ".cpp", ".c", ".cc", ".h", ".hpp", ".cxx"] 
+        return any(s.lower().endswith(ext) for ext in exts)
+
+    result = ClangTidyCacheHash(opts)
+
+    # --- Source file content (potentially pre-processed)
+    if len(co_args) == 0:
+        for arg in ct_args[1:]:
+            if os.path.exists(arg) and _is_src_ext(arg):
+                with open(arg, "rb") as srcfd:
+                    result.update(srcfd.read())
+    else:
+        # Execute the compiler command defined by the compiler arguments. At this
+        # point if we have compiler arguments with expect that it defines a valid
+        # command to get the pre-processed output.
+        # If we have a valid output this gets added to the hash.
+        proc = subprocess.Popen(
+            co_args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        stdout, stderr = proc.communicate()
+        if opts.running_on_msvc():
+            if proc.returncode != 0:
+                return None
+        else:
+            if stderr:
+                return None
+
+        result.update(stdout)
+
+    for arg in ct_args[1:]:
+        if os.path.exists(arg) and _is_src_ext(arg):
+            source_file = os.path.normpath(os.path.realpath(arg))
+            break
+
+    # --- Config Contents ------------------------------------------------------
+
+    config_directories = opts.directories_with_clang_tidy()
+    
+    ct_config_paths = set()
+
+    for directory in config_directories:
+        directory = os.path.normpath(directory.strip())
+        common_path = os.path.commonpath([source_file, directory])
+
+        if common_path == directory:
+            ct_config_paths.add(os.path.join(directory, '.clang-tidy'))
+
+    for ct_config in sorted(ct_config_paths):
+        with open(ct_config, "rt") as ct_config:
+            for line in ct_config:
+                chunk = opts.adjust_chunk(line)
+                result.update(chunk)
+
+    # --- Clang-Tidy and Compiler Args -----------------------------------------
+
+    def _omit_after(args, excl):
+        omit_next = False
+        for arg in args:
+            omit_this = arg in excl
+            if not omit_this and not omit_next:
+                yield arg
+            omit_next = omit_this
+
+    ct_args = list(_omit_after(ct_args, ["-export-fixes"]))
+
+    for chunk in sorted(set([opts.adjust_chunk(arg) for arg in ct_args[1:]])):
+        if not opts.exclude_hash(chunk):
+            result.update(chunk)
+
+    for chunk in sorted(set([opts.adjust_chunk(arg) for arg in co_args[1:]])):
+        if not opts.exclude_hash(chunk):
+            result.update(chunk)
+
+    return result.hexdigest()
+
+# ------------------------------------------------------------------------------
+def print_stats(log, opts):
+    def _format_bytes(s):
+        if s < 10000:
+            return "%d B" % (s)
+        if s < 10000000:
+            return "%d kB" % (s / 1000)
+        return "%d MB" % (s / 1000000)
+
+    def _format_time(s):
+        if s < 60:
+            return "%d seconds" % (s)
+        if s < 3600:
+            return "%d minutes %d seconds" % (s / 60, s % 60)
+        if s < 86400:
+            return "%d hours %d minutes" % (s / 3600, (s / 60) % 60)
+        if s < 604800:
+            return "%d days %d hours" % (s / 86400, (s / 3600) % 24)
+        if int(s / 86400) % 7 == 0:
+            return "%d weeks" % (s / 604800)
+        return "%d weeks %d days" % (s / 604800, (s / 86400) % 7)
+
+    cache = ClangTidyCache(log, opts)
+    stats = cache.query_stats(opts)
+    entries = [
+        ("Server host", lambda o, s: o.rest_host()),
+        ("Server port", lambda o, s: "%d" % o.rest_port()),
+        ("Long-term hit rate", lambda o, s: "%.1f %%" %
+         (s["total_hit_rate"] * 100.0)),
+        ("Hit rate", lambda o, s: "%.1f %%" % (s["hit_rate"] * 100.0)),
+        ("Hit count", lambda o, s: "%d" % s["hit_count"]),
+        ("Miss count", lambda o, s: "%d" % s["miss_count"]),
+        ("Miss rate", lambda o, s: "%.1f %%" % (s["miss_rate"] * 100.0)),
+        ("Max hash age", lambda o, s: "%d days" %
+         max(int(k) for k in s["age_days_histogram"])),
+        ("Max hash hits", lambda o, s: "%d" % max(int(k)
+         for k in s["hit_count_histogram"])),
+        ("Cache size", lambda o, s: _format_bytes(s["saved_size_bytes"])),
+        ("Cached hashes", lambda o, s: "%d" % s["cached_count"]),
+        ("Cleaned hashes", lambda o, s: "%d" % s["cleaned_count"]),
+        ("Cleaned ago", lambda o, s: _format_time(s["cleaned_seconds_ago"])),
+        ("Saved ago", lambda o, s: _format_time(s["saved_seconds_ago"])),
+        ("Uptime", lambda o, s: _format_time(s["uptime_seconds"]))
+    ]
+
+    max_len = max(len(e[0]) for e in entries)
+    for label, fmtfunc in entries:
+        padding = " " * (max_len-len(label))
+        try:
+            print(label+":", padding, fmtfunc(opts, stats))
+        except:
+            print(label+":", padding, "N/A")
+
+# ------------------------------------------------------------------------------
+def clear_stats(log, opts):
+    cache = ClangTidyCache(log, opts)
+    cache.clear_stats(opts)
+
+# ------------------------------------------------------------------------------
+def run_clang_tidy_cached(log, opts):
+    cache = ClangTidyCache(log, opts)
+    digest = None
+    try:
+        digest = hash_inputs(opts)
+        if digest and opts.save_output():
+            data = cache.get_cache_data(digest)
+            if data is not None:
+                sys.stdout.write(data.decode("utf8"))
+                return 0
+        elif digest and cache.is_cached(digest):
+            return 0
+        else:
+            pass
+    except Exception as error:
+        log.error(str(error))
+
+    proc = subprocess.Popen(
+        opts.original_args(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    stdout, stderr = proc.communicate()
+    sys.stdout.write(stdout.decode("utf8"))
+    sys.stderr.write(stderr.decode("utf8"))
+
+    tidy_success = True
+    if proc.returncode != 0:
+        tidy_success = False
+
+    if stdout and not opts.ignore_output():
+        tidy_success = False
+
+    if tidy_success and digest:
+        try:
+            if opts.save_output():
+                cache.store_in_cache_with_data(digest, stdout)
+            else:
+                cache.store_in_cache(digest)
+        except Exception as error:
+            log.error(str(error))
+
+    return proc.returncode
+
+# ------------------------------------------------------------------------------
+def main():
+    log = logging.getLogger(os.path.basename(__file__))
+    log.setLevel(logging.WARNING)
+    debug = False
+    try:
+        opts = ClangTidyCacheOpts(log, sys.argv[1:])
+        debug = opts.debug_enabled()
+        if opts.should_print_dir():
+            print(opts.cache_dir)
+        elif opts.should_remove_dir():
+            import shutil
+            try:
+                shutil.rmtree(opts.cache_dir)
+            except FileNotFoundError:
+                pass
+        elif opts.should_print_stats():
+            print_stats(log, opts)
+        elif opts.should_zero_stats():
+            clear_stats(log, opts)
+        else:
+            return run_clang_tidy_cached(log, opts)
+        return 0
+    except Exception as error:
+        if debug:
+            raise
+        else:
+            log.error("%s: %s" % (str(type(error)), str(error)))
+        return 1
+
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    sys.exit(main())
