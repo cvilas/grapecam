@@ -72,7 +72,7 @@ else()
   ExternalProject_Add(
     sdl3
     GIT_REPOSITORY "https://github.com/libsdl-org/SDL"
-    GIT_TAG main #${SDL3_VERSION_REQUIRED}
+    GIT_TAG "preview-${SDL3_VERSION_REQUIRED}"
     GIT_SHALLOW true
     CMAKE_ARGS ${SDL3_CMAKE_ARGS})
 endif()
